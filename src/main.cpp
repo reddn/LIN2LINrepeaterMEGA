@@ -1,11 +1,10 @@
 #include <Arduino.h>
-#include <CustomSoftwareSerial.h>
+
 
 #define Serialwrite Serial1.write
 // #define Serialwrite customSerial->write  //on change fix setup
 #define DEBUG 1
 
-CustomSoftwareSerial* customSerial;
 
 uint8_t lkas_off_array[][4] =  {{0x20,0x80,0xc0,0xa0},{0x00,0x80,0xc0,0xc0}};
 uint8_t counterbit = 0;
@@ -19,6 +18,7 @@ uint8_t createdMsg[4][5]; //4 buffers of 5 bytes, the 4 bytes is the frame, the 
 uint8_t lastCreatedMsg = 0xff;
 uint8_t lastCreatedMsgSent = 0xff;
 volatile uint8_t  sendArrayFlag = 0;
+volatile uint8_t checkMsgFlag = 0;
 int16_t rotaryCounter = 0;  // min is 0 max is 906 -- default sent to center
 uint16_t mainCounter = 0;
 uint8_t forceRotaryAsInput = 0;
@@ -31,8 +31,11 @@ unsigned long pin13LedLastChange =0;
 uint8_t pin13LedStatus = 0;
 uint8_t useOP2byteSerialRX = 1;
 uint8_t MCUSerialData[4];
-uint8_t MCUSerialDataPos = 1;
+uint8_t MCUSerialDataPos = 0;
 unsigned long lastTimeSerialSent = 0;
+uint8_t rotaryMsg[2][4];
+int8_t rotaryMsgReadyToSend = -1;
+int8_t rotaryMsgToSend = -1;
 
 void readSettingsPins();
 void sendLKASOffArray();
@@ -55,6 +58,9 @@ uint8_t chksm(uint16_t*);
 void setupTimersOld();
 void sendMCUSerial();
 void setupTimer1();
+void createRotaryMsg();
+void checkMsg();
+void sendRotaryMsg();
 
 // all input pins are active low (except rotary pot input)
 //7: Force LKAS ON  - 12: set Rotary POT current pos as center  -
@@ -69,9 +75,9 @@ void setup() {
   Serial3.begin(9600,SERIAL_8E1);
 	cli();  // no interrupts
 	setupTimer1();
-	// setupTimersOld();
+	setupTimersOld();
 	sei();//allow interrupts
-	pinMode(12, INPUT_PULLUP);
+	pinMode(12, INPUT_PULLUP); // make current position of POT center
 	pinMode(7, INPUT_PULLUP); //Force LKAS Active
 	pinMode(13,OUTPUT);
 	pinMode(A0, INPUT_PULLUP);  //use Rotary encoder as input -- active low
@@ -80,51 +86,44 @@ void setup() {
 	digitalWrite(13,LOW);
 
 	readSettingsPins();
-
+	checkMsg();
 }
 
 /*** OP to LIN2LIN data structure (it still sends 4 bytes, but the last 2 are 0x00).
-//i will prolly change that later to only 2 bytes, but this code will not need to be changed
+//i will probably change that later to only 2 bytes, but this code will not need to be changed
 // b01A0####    ####is big_steer   A = Active   first 2 bits is the byte counter
 // b10A#####    ##### is little steer  ***/
 void loop() {
+	if(checkMsgFlag) checkMsg();
 	if(useOP2byteSerialRX){
 		checkForRightCounterInPreCreatedMsg();
-		// checkAndRunSendArrayFlag(); //read seteting pin
 	}
-	handleRotary();
-  readSettingsPins();
+	// handleRotary();
+  // readSettingsPins();
 	if(useOP2byteSerialRX) {
-		// checkAndRunSendArrayFlag();
 		checkOPSerialRxInput(); //modify this... use to be useSerialRxAsInput
-	}
-	else checkMCUSerialRxInput();
-	readSettingsPins();
+	}	else checkMCUSerialRxInput();
+	// readSettingsPins();
   pin13LedFunc();
 }  // end of loop
 
 void checkAndRunSendArrayFlag(){
-
 	if(errorcount > 1) {
 		lkas_active = false;
 		errorcount = 0;
-		// sendArrayFlag = 0;
-		if(sendDebug) Serial.println("error greater than1..");
+		if(sendDebug) Serial.println("error greater than1.. LKAS off.");
 	}
-	// if(sendArrayFlag){
-		if(lkas_active){ //if lkas_active need to send the live data, if not, send
-			sendLKASOnArray();
-		}else {
-			sendLKASOffArray();
-		}
+	if(lkas_active){ //if lkas_active need to send the live data, if not, send
+		sendLKASOnArray();
+	}else {
+		sendLKASOffArray();
+	}
 
-		// sendArrayFlag = 0;
-	// }
 }
  					/***  LOOP directly called functions ***/
 
 void checkOPSerialRxInput(){
-	while(Serial.available()){
+	while(Serial1.available()){
 		uint8_t temp = Serial.read();
 		if((temp >> 6) <3)
 		// Serial.print(temp);
@@ -142,6 +141,46 @@ void checkOPSerialRxInput(){
 	} // end of while
 }
 
+void handleRotary(){  // min is 0 max is 906 of A5 using the rotary
+	rotaryCounter = (analogRead(A5) - centerPoint) / 3;  //centerPoint is 450   //new center is 0. neg is left, pos is right
+	if(centerPoint != 450){
+		if(rotaryCounter > 255) rotaryCounter = 255;
+		if(rotaryCounter < -255) rotaryCounter = -255;
+	}
+}  //Need to scale the center so its not soo touchy.
+
+void checkForRightCounterInPreCreatedMsg(){
+	if(lastCreatedMsg != lastCreatedMsgSent){
+		if((createdMsg[lastCreatedMsg][0] >> 5) != counterbit){
+			createSerialMsg(&createdMsg[lastCreatedMsg][4], &lastCreatedMsg);
+		}
+	}
+}
+
+void checkMsg(){
+	readSettingsPins();
+	handleRotary();
+	if(forceRotaryAsInput) {
+		createRotaryMsg();
+
+	}
+	checkMsgFlag = 0;
+}
+
+void readSettingsPins(){
+	forceRotaryAsInput = !digitalRead(A0);
+	forceLkasActive = !digitalRead(7);
+	sendDebug = !digitalRead(A4);
+
+	useOP2byteSerialRX = digitalRead(A3);
+	if(forceLkasActive_prev != forceLkasActive) {
+		lkas_active = forceLkasActive;
+		forceLkasActive_prev = forceLkasActive;
+	}
+	if(!digitalRead(12)) 	centerPoint = analogRead(A5);
+}
+										/***  Other Functions ***/
+
 
 
 void sendLKASOffArray(){
@@ -156,7 +195,7 @@ void sendLKASOffArray(){
 
 void sendLKASOnArray(){
 	if(forceRotaryAsInput){
-		createAndSendSerialMsgUsingRotary();
+		sendRotaryMsg();
 		counterbit = counterbit > 0 ? 0x00 : 0x01;
 		return;
 	}
@@ -177,34 +216,18 @@ void sendLKASOnArray(){
 	counterbit = counterbit > 0 ? 0x00 : 0x01;
 }
 
-void checkForRightCounterInPreCreatedMsg(){
-	if(lastCreatedMsg != lastCreatedMsgSent){
-		if((createdMsg[lastCreatedMsg][0] >> 5) != counterbit){
-			createSerialMsg(&createdMsg[lastCreatedMsg][4], &lastCreatedMsg);
-		}
-	}
-}
-
-void handleRotary(){  // min is 0 max is 906 of A5 using the rotary
-	rotaryCounter = (analogRead(A5) - centerPoint) / 3;  //centerPoint is 450   //new center is 0. neg is left, pos is right
-	if(centerPoint != 450){
-		if(rotaryCounter > 255) rotaryCounter = 255;
-		if(rotaryCounter < -255) rotaryCounter = -255;
-	}
-}  //Need to scale the center so its not soo touchy.
-
 void checkMCUSerialRxInput(){
-	while(Serial.available()){
+	while(Serial1.available()){
 		uint8_t tempdata;
 		tempdata = Serial.read();
-		if(MCUSerialDataPos == 0){  //start at 1 so it equals the last 2 bi
+		if(MCUSerialDataPos == 0){  //start at 1 so it equals the last 2 bi !! changed to start at 0... too confusing
 			if((tempdata >> 5) < 2) {
 				counterbit = tempdata >> 5; //keeps counter bits aligned
 				MCUSerialData[0] = tempdata;
 				MCUSerialDataPos++;
 			}
 			else return;  //if on dataPosition 0, and data is not < 2.. return, somethings fuckedup
-		} else{
+		} else{ //MCUSerialDataPos NOT == 0
 			MCUSerialData[MCUSerialDataPos] = tempdata;
 			MCUSerialDataPos++;
 			if(MCUSerialDataPos == 2) {
@@ -249,22 +272,23 @@ void putByteInNextBuff(uint8_t *msgnum, uint8_t *temp){
 	}
 }
 
-void readSettingsPins(){
-	forceRotaryAsInput = !digitalRead(A0);
-	forceLkasActive = !digitalRead(7);
-	sendDebug = !digitalRead(A4);
-	useOP2byteSerialRX = digitalRead(A3);
-	if(forceLkasActive_prev != forceLkasActive) {
-		lkas_active = forceLkasActive;
-		forceLkasActive_prev = forceLkasActive;
-	}
-	if(!digitalRead(12)) 	centerPoint = analogRead(A5);
-}
+void createRotaryMsg(){
+	int8_t currentIndex;
+	if(rotaryMsgToSend == 0) currentIndex = 1;
+	else currentIndex = 0;
+	rotaryMsg[currentIndex][0] = (counterbit << 5) | ((rotaryCounter >> 12) & 0x8) | ((rotaryCounter >> 5) & 0x7);
+	rotaryMsg[currentIndex][1] = 0xA0 | (rotaryCounter & 0x1F);
+	rotaryMsg[currentIndex][2] =  0x80;
+	uint16_t total = rotaryMsg[currentIndex][0] + rotaryMsg[currentIndex][1] + rotaryMsg[currentIndex][2];
+	rotaryMsg[currentIndex][3] = chksm(&total);
+	rotaryMsgToSend = currentIndex;
+	rotaryMsgReadyToSend = 1;
 
+}
 
 void createAndSendSerialMsgUsingRotary(){
 	uint8_t data[4] = {0x00,0x00,0x00,0x00};
-	data[0] = (counterbit << 5) | ((rotaryCounter >> 12) & 0x8) | ((rotaryCounter >> 5) & 0xF);
+	data[0] = (counterbit << 5) | ((rotaryCounter >> 12) & 0x8) | ((rotaryCounter >> 4) & 0xF);
 	data[1] = 0xA0 | (rotaryCounter & 0x1F);
 	data[2] =  0x80;
 	Serialwrite(data[0]);
@@ -274,6 +298,15 @@ void createAndSendSerialMsgUsingRotary(){
 	data[3] = chksm(&total);
 	Serialwrite(data[3]);
 	if(sendDebug)	sendSerialDebugDataOverSerial((uint8_t*)&data[0]);
+}
+
+void sendRotaryMsg(){
+	if(rotaryMsgReadyToSend < 1) sendLKASOffArray();
+	Serialwrite(rotaryMsg[rotaryMsgToSend][0]);
+	Serialwrite(rotaryMsg[rotaryMsgToSend][1]);
+	Serialwrite(rotaryMsg[rotaryMsgToSend][2]);
+	Serialwrite(rotaryMsg[rotaryMsgToSend][3]);
+	if(sendDebug)	sendSerialDebugDataOverSerial((uint8_t*)&rotaryMsg[rotaryMsgToSend][0]);
 }
 
 void createSerialMsg(uint8_t *localbuffi, uint8_t *msgi){ //array index of buff (even)
@@ -286,6 +319,8 @@ void createSerialMsg(uint8_t *localbuffi, uint8_t *msgi){ //array index of buff 
 }
 
 void sendSerialDebugDataOverSerial(uint8_t* thisdata){
+	unsigned long _timeBetween = micros() - lastTimeSerialSent;
+	lastTimeSerialSent = micros();
 	if((serialDebugSendCounter % 15)== 0){
 		printuint_t(thisdata[0]);
 		Serial.print(" ");
@@ -302,10 +337,9 @@ void sendSerialDebugDataOverSerial(uint8_t* thisdata){
 		Serial.print(" --a ");
 		Serial.print(rotaryCounter, DEC);
 		Serial.print(" t ");
-		Serial.println(micros() - lastTimeSerialSent, DEC);
+		Serial.println(_timeBetween, DEC);
 	}
 	serialDebugSendCounter++;
-	lastTimeSerialSent = micros();
 }
 
 void printuint_t(uint8_t var) {
@@ -373,26 +407,24 @@ uint8_t chksm(uint16_t *input){
 
 ISR(TIMER2_COMPA_vect) {
   // sendArrayFlag = 1;
-  checkAndRunSendArrayFlag();
+  // checkAndRunSendArrayFlag();
+	checkMsgFlag = 1;
 }//
 ISR(TIMER1_COMPA_vect){
-	// sendArrayFlag = 1;
 	checkAndRunSendArrayFlag();
+	// sendArrayFlag = 1;
 }//
-ISR(TIMER0_COMPA_vect){sendArrayFlag = 1;}//
+
+// ISR(TIMER0_COMPA_vect){sendArrayFlag = 1;}//
 
 void setupTimersOld(){
   TCCR2A = 0;// set entire TCCR2A register to 0
-  TCCR2B = 0;// same for TCCR2B
-  TCNT2  = 0;//initialize counter value to 0
-  // set compare match register for 8khz increments
-  OCR2A = 155 ;// = (16*10^6) / (87.4hz*1024) - 1 (must be <256)  177== 11.4ms apart 87.2 hz
-  // turn on CTC mode
-  TCCR2A |= 0b10; //(1 << WGM21);
-  // Set CS21 bit for 1024 prescaler
-  TCCR2B |= 0b111; //(1 << CS12) | (1 << CS10;
-  // enable timer compare interrupt
-  TIMSK2 |= (1 << OCIE2A);
+  TCCR2B = 0;//
+  TCNT2  = 0;//actual counter
+  OCR2A = 68 ;// 68 =  229hz  call every 4.352ms
+  TCCR2A |= 0b10; // CTC mode
+  TCCR2B |= 0b111; //111 = 1024 prescale
+  TIMSK2 |= (1 << OCIE2A); //enable
 }
 
 void setupTimer1WebSite(){
@@ -416,7 +448,7 @@ void setupTimer1(){
   TCCR1B = 0;// same for TCCR2B
   TCNT1  = 0;//initialize counter value to 0
   // set compare match register for 8khz increments
-  OCR1A = 20000 ;// = (16*10^6) / (87.4hz*1024) - 1 (must be <256) // mod from 3690 to half, then 66%
+  OCR1A = 20012 ;// 20014 lags 1 bit every minute.. 20013 is faster, 1 bit every 20 seconds
   // turn on CTC mode
   TCCR1A |= 0b00; //(1 << WGM21);    wgm 2 = 1 , 1= 0, 0=0
   // Set CS21 bit for 1024 prescaler
